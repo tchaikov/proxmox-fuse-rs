@@ -8,6 +8,6 @@ pub(crate) mod util;
 pub use sys::{EntryParam, ROOT_ID, ReplyBufState};
 
 #[doc(inline)]
-pub use requests::Request;
+pub use requests::{ReplyError, Request};
 
 pub use session::{Fuse, FuseSession, FuseSessionBuilder};

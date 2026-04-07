@@ -17,6 +17,47 @@ use crate::util::Stat;
 // expose this here for documentation purposes
 pub use crate::sys::FuseFileInfo;
 
+/// Error type for reply methods where cancellation has semantic consequences.
+///
+/// When the kernel cancels a FUSE request (via `FUSE_INTERRUPT`), `fuse_reply_*` returns
+/// `-ENOENT`. For most requests this is harmless, but for `Open`, `Create`, and `Lookup` it means:
+///
+/// - `Open`/`Create`: No `Release` event will arrive, so any allocated file handle must be cleaned
+///   up immediately.
+/// - `Lookup`: The lookup count was NOT incremented, so the caller must not expect a corresponding
+///   `Forget`.
+#[derive(Debug)]
+pub enum ReplyError {
+    /// The kernel cancelled the request before the reply could be delivered.
+    Cancelled,
+    /// An I/O error occurred while sending the reply.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for ReplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplyError::Cancelled => f.write_str("request was cancelled"),
+            ReplyError::Io(err) => write!(f, "reply I/O error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ReplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ReplyError::Cancelled => None,
+            ReplyError::Io(err) => Some(err),
+        }
+    }
+}
+
+impl From<io::Error> for ReplyError {
+    fn from(err: io::Error) -> Self {
+        ReplyError::Io(err)
+    }
+}
+
 #[derive(Debug)]
 pub struct RequestGuard {
     raw: sys::Request,
@@ -65,6 +106,20 @@ macro_rules! reply_result {
             Ok(())
         } else {
             Err(io::Error::from_raw_os_error(-rc))
+        }
+    }};
+}
+
+macro_rules! reply_result_cancellable {
+    ($self:ident : $expr:expr) => {{
+        let rc = unsafe { $expr };
+        if rc == 0 {
+            let _done = $self.request.into_raw();
+            Ok(())
+        } else if -rc == libc::ENOENT {
+            Err(ReplyError::Cancelled)
+        } else {
+            Err(ReplyError::Io(io::Error::from_raw_os_error(-rc)))
         }
     }};
 }
@@ -184,14 +239,8 @@ impl FuseRequest for Lookup {
 }
 
 impl Lookup {
-    pub fn reply(self, entry: &sys::EntryParam) -> io::Result<()> {
-        let rc = unsafe { sys::fuse_reply_entry(self.request.raw, Some(entry)) };
-        if rc == 0 {
-            let _done = self.request.into_raw();
-            Ok(())
-        } else {
-            Err(io::Error::from_raw_os_error(-rc))
-        }
+    pub fn reply(self, entry: &sys::EntryParam) -> Result<(), ReplyError> {
+        reply_result_cancellable!(self: sys::fuse_reply_entry(self.request.raw, Some(entry)))
     }
 }
 
@@ -442,9 +491,12 @@ impl FuseRequest for Create {
 
 impl Create {
     /// The `fh` provided here will be available in later requests for this file handle.
-    pub fn reply(mut self, entry: &sys::EntryParam, fh: u64) -> io::Result<()> {
+    ///
+    /// If this returns `ReplyError::Cancelled`, no `Release` event will arrive for this file
+    /// handle. The caller must clean up any resources associated with `fh` immediately.
+    pub fn reply(mut self, entry: &sys::EntryParam, fh: u64) -> Result<(), ReplyError> {
         self.file_info.fh = fh;
-        reply_result!(self: sys::fuse_reply_create(self.request.raw, Some(entry), &self.file_info))
+        reply_result_cancellable!(self: sys::fuse_reply_create(self.request.raw, Some(entry), &self.file_info))
     }
 }
 
@@ -493,9 +545,12 @@ impl FuseRequest for Open {
 
 impl Open {
     /// The `fh` provided here will be available in later requests for this file handle.
-    pub fn reply(mut self, fh: u64) -> io::Result<()> {
+    ///
+    /// If this returns `ReplyError::Cancelled`, no `Release` event will arrive for this file
+    /// handle. The caller must clean up any resources associated with `fh` immediately.
+    pub fn reply(mut self, fh: u64) -> Result<(), ReplyError> {
         self.file_info.fh = fh;
-        reply_result!(self: sys::fuse_reply_open(self.request.raw, &self.file_info))
+        reply_result_cancellable!(self: sys::fuse_reply_open(self.request.raw, &self.file_info))
     }
 }
 

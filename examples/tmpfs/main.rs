@@ -9,7 +9,7 @@ use futures::select;
 use futures::stream::TryStreamExt;
 use tokio::signal::unix::{SignalKind, signal};
 
-use proxmox_fuse::requests::{self, FuseRequest, SetTime};
+use proxmox_fuse::requests::{self, FuseRequest, ReplyError, SetTime};
 use proxmox_fuse::{EntryParam, Fuse, ReplyBufState, Request};
 
 #[macro_use]
@@ -61,6 +61,13 @@ fn to_entry_param(stat: &libc::stat) -> EntryParam {
     }
 }
 
+fn handle_reply_err(err: ReplyError) -> Result<(), Error> {
+    match err {
+        ReplyError::Cancelled => Ok(()),
+        ReplyError::Io(err) => Err(Error::from(err)),
+    }
+}
+
 fn handle_io_err(
     err: io::Error,
     reply: impl FnOnce(io::Error) -> io::Result<()>,
@@ -98,7 +105,11 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
                 Err(err) => handle_err(err, |err| request.io_fail(err))?,
             },
             Request::Lookup(request) => match fs.lookup_at(request.parent, &request.file_name) {
-                Ok(node) => request.reply(&to_entry_param(&node.leak().stat.read().unwrap()))?,
+                Ok(node) => {
+                    if let Err(err) = request.reply(&to_entry_param(&node.leak().stat.read().unwrap())) {
+                        handle_reply_err(err)?;
+                    }
+                }
                 Err(err) => handle_io_err(err, |err| request.io_fail(err))?,
             },
             Request::Forget(request) => match fs.forget(request.inode, request.count as usize) {
@@ -132,7 +143,9 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
                     Ok(entry) => {
                         // CREATE acts as `Lookup` + `Open`
                         entry.increment_lookup();
-                        request.reply(&to_entry_param(&entry.leak().stat.read().unwrap()), 0)?
+                        if let Err(err) = request.reply(&to_entry_param(&entry.leak().stat.read().unwrap()), 0) {
+                            handle_reply_err(err)?;
+                        }
                     }
                     Err(err) => handle_io_err(err, |err| request.io_fail(err))?,
                 }
@@ -151,7 +164,11 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
                 }
             }
             Request::Open(request) => match fs.lookup(request.inode) {
-                Ok(_node) => request.reply(0)?,
+                Ok(_node) => {
+                    if let Err(err) = request.reply(0) {
+                        handle_reply_err(err)?;
+                    }
+                }
                 Err(err) => handle_io_err(err, |err| request.io_fail(err))?,
             },
             Request::Release(request) => match fs.forget(request.inode, 1) {
