@@ -1,7 +1,6 @@
 //! The tmpfs.
 
 use std::collections::BTreeMap;
-use std::convert::TryFrom;
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -362,10 +361,10 @@ impl FsEntry {
     */
 
     fn on_drop(&self, fs: &Fs) {
-        if let FsContent::Dir(dir) = &self.content {
-            if let Err(err) = dir.on_drop(fs) {
-                eprintln!("error cleaning out directory: {}", err);
-            }
+        if let FsContent::Dir(dir) = &self.content
+            && let Err(err) = dir.on_drop(fs)
+        {
+            eprintln!("error cleaning out directory: {}", err);
         }
     }
 }

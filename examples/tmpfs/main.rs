@@ -1,4 +1,3 @@
-use std::convert::TryFrom;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::{io, mem};
@@ -27,8 +26,7 @@ async fn main() -> Result<(), Error> {
     let path = args.next().ok_or_else(|| format_err!("missing path"))?;
 
     let mut interrupt = signal(SignalKind::interrupt())?;
-    let fuse = Fuse::builder("mytmpfs")?
-        .debug()
+    let fuse = Fuse::builder("mytmpfs")
         .enable_readdir()
         .enable_mkdir()
         .enable_rmdir()
@@ -38,7 +36,7 @@ async fn main() -> Result<(), Error> {
         .enable_setattr()
         .enable_read()
         .enable_write()
-        .build()?
+        .build()
         .mount(Path::new(&path))?;
 
     select! {
@@ -52,13 +50,7 @@ async fn main() -> Result<(), Error> {
 }
 
 fn to_entry_param(stat: &libc::stat) -> EntryParam {
-    EntryParam {
-        inode: stat.st_ino,
-        generation: 1,
-        attr: *stat,
-        attr_timeout: f64::MAX,
-        entry_timeout: f64::MAX,
-    }
+    EntryParam::simple(stat.st_ino, *stat)
 }
 
 fn handle_reply_err(err: ReplyError) -> Result<(), Error> {
@@ -106,7 +98,9 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
             },
             Request::Lookup(request) => match fs.lookup_at(request.parent, &request.file_name) {
                 Ok(node) => {
-                    if let Err(err) = request.reply(&to_entry_param(&node.leak().stat.read().unwrap())) {
+                    if let Err(err) =
+                        request.reply(&to_entry_param(&node.leak().stat.read().unwrap()))
+                    {
                         handle_reply_err(err)?;
                     }
                 }
@@ -141,10 +135,14 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
                 );
                 match reply {
                     Ok(entry) => {
-                        // CREATE acts as `Lookup` + `Open`
-                        entry.increment_lookup();
-                        if let Err(err) = request.reply(&to_entry_param(&entry.leak().stat.read().unwrap()), 0) {
+                        // CREATE acts as `Lookup` + `Open`: only increment the lookup
+                        // count after a successful reply — if cancelled, the kernel never
+                        // saw the inode and will not send a matching Forget.
+                        let stat = *entry.stat.read().unwrap();
+                        if let Err(err) = request.reply(&to_entry_param(&stat), 0) {
                             handle_reply_err(err)?;
+                        } else {
+                            entry.increment_lookup();
                         }
                     }
                     Err(err) => handle_io_err(err, |err| request.io_fail(err))?,
@@ -197,10 +195,7 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
             Request::Read(request) => {
                 // For simplicity we just limit reads to 1 MiB for now...
                 let size = request.size.min(1024 * 1024);
-                let mut buf = unsafe {
-                    let data = std::alloc::alloc(std::alloc::Layout::array::<u8>(size).unwrap());
-                    Box::from_raw(std::ptr::slice_from_raw_parts_mut(data, size))
-                };
+                let mut buf = vec![0u8; size];
                 match fs.read(request.inode, &mut buf, request.offset) {
                     Ok(got) => request.reply(&buf[..got])?,
                     Err(err) => handle_io_err(err, |err| request.io_fail(err))?,
@@ -213,23 +208,20 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
 }
 
 fn handle_readdir(fs: &Fs, request: &mut requests::Readdir) -> Result<(), Error> {
-    let offset = match isize::try_from(request.offset) {
-        Ok(offset) => offset,
-        Err(_) => bail!("bad offset"),
-    };
+    let offset = request.offset as usize;
 
     let dir = fs.lookup(request.inode)?;
 
     match &dir.content {
         fs::FsContent::Dir(content) => {
             let files = content.files.read().unwrap();
-            let file_count = files.len() as isize;
+            let file_count = files.len();
             let mut next = offset;
-            for (name, &inode) in files.iter().skip(offset as usize) {
+            for (name, &inode) in files.iter().skip(offset) {
                 next += 1;
                 let inode = fs.lookup(inode)?;
                 let stat = inode.stat.read().unwrap();
-                match request.add_entry(name, &stat, next)? {
+                match request.add_entry(name, &stat, next as u64)? {
                     ReplyBufState::Ok => (),
                     ReplyBufState::Full => return Ok(()),
                 }
@@ -240,7 +232,7 @@ fn handle_readdir(fs: &Fs, request: &mut requests::Readdir) -> Result<(), Error>
                 next += 1;
                 let inode = fs.lookup(dir.parent)?;
                 let stat = inode.stat.read().unwrap();
-                match request.add_entry(OsStr::new(".."), &stat, next)? {
+                match request.add_entry(OsStr::new(".."), &stat, next as u64)? {
                     ReplyBufState::Ok => (),
                     ReplyBufState::Full => return Ok(()),
                 }
@@ -248,7 +240,7 @@ fn handle_readdir(fs: &Fs, request: &mut requests::Readdir) -> Result<(), Error>
 
             if next == file_count + 1 {
                 next += 1;
-                match request.add_entry(OsStr::new("."), &dir.stat.read().unwrap(), next)? {
+                match request.add_entry(OsStr::new("."), &dir.stat.read().unwrap(), next as u64)? {
                     ReplyBufState::Ok => (),
                     ReplyBufState::Full => return Ok(()),
                 }

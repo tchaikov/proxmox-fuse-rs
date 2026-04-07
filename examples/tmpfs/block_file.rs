@@ -105,9 +105,7 @@ impl BlockFile {
                     break;
                 }
                 let (to_clear, remaining) = buf.split_at_mut(empty_len as usize);
-                unsafe {
-                    std::ptr::write_bytes(to_clear.as_mut_ptr(), 0, to_clear.len());
-                }
+                to_clear.fill(0);
                 offset += to_clear.len() as u64;
                 buf = remaining;
                 &extent.data[..]
@@ -121,9 +119,7 @@ impl BlockFile {
         }
 
         // clear the remaining buffer with zeroes:
-        unsafe {
-            std::ptr::write_bytes(buf.as_mut_ptr(), 0, buf.len());
-        }
+        buf.fill(0);
 
         Ok(return_size)
     }
@@ -158,13 +154,8 @@ impl BlockFile {
                 let block_ofs = offset & !self.block_mask;
                 let data_end_ofs = offset + buf.len() as u64;
                 let extent_size = (data_end_ofs - block_ofs) as usize;
-                let mut data = Vec::with_capacity(extent_size);
+                let mut data = vec![0u8; extent_size];
                 let leading_zeros = (offset - block_ofs) as usize;
-                unsafe {
-                    data.set_len(extent_size);
-                    let to_zero = &mut data[..leading_zeros];
-                    std::ptr::write_bytes(to_zero.as_mut_ptr(), 0, to_zero.len());
-                }
                 data[leading_zeros..].copy_from_slice(buf);
                 self.extents.push(Extent {
                     offset: block_ofs,
@@ -208,12 +199,7 @@ impl BlockFile {
             needed_end = (needed_end + block_mask_usize) & !block_mask_usize;
         }
 
-        extent.data.reserve(needed_end - extent.data.len());
-        unsafe {
-            extent.data.set_len(needed_end);
-            let to_zero = &mut extent.data[in_end..];
-            std::ptr::write_bytes(to_zero.as_mut_ptr(), 0, to_zero.len());
-        }
+        extent.data.resize(needed_end, 0);
 
         extent.data[in_ofs..in_end].copy_from_slice(buf);
 

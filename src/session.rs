@@ -1,719 +1,648 @@
-use std::cell::RefCell;
+//! FUSE session and stream implementation.
+//!
+//! This reads FUSE requests directly from `/dev/fuse` and yields them as a `Stream`.
+//! No libfuse C library is involved.
+
 use std::collections::VecDeque;
-use std::ffi::{CStr, CString, OsStr};
-use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::io;
+use std::mem;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::ptr::{self, NonNull};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::{io, mem};
 
 use anyhow::{Error, bail, format_err};
 use futures::ready;
 use futures::stream::{FusedStream, Stream};
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
-use crate::fuse_fd::FuseFd;
+use crate::mount;
+use crate::protocol::{self, FuseInHeader, FuseInitIn, FuseInitOut, Opcode};
 use crate::requests::{self, Request, RequestGuard};
-use crate::sys;
+use crate::sys::FuseFileInfo;
 use crate::util::Stat;
 
-/// The default set of operations enabled when nothing else is set via the `FuseSessionBuilder`
-/// methods.
-///
-/// By default the stream can yield the following requests:
-/// * `Lookup`
-/// * `Forget`
-/// * `Getattr`
-pub const DEFAULT_OPERATIONS: sys::Operations = sys::Operations {
-    destroy: Some(FuseData::destroy),
-    lookup: Some(FuseData::lookup),
-    forget: Some(FuseData::forget),
-    getattr: Some(FuseData::getattr),
-    ..sys::Operations::DEFAULT
-};
+/// Maximum write size negotiated with the kernel.
+const MAX_WRITE: usize = 256 * 1024;
+/// Read buffer size. The kernel requires at least:
+///   max(FUSE_MIN_READ_BUFFER, sizeof(fuse_in_header) + sizeof(fuse_write_in) + max_write)
+///   = max(8192, 40 + 40 + 262144) = 262224 bytes
+const READ_BUF_SIZE: usize = MAX_WRITE + 4096; // 266240 ≥ 262224
+const _: () = assert!(READ_BUF_SIZE >= protocol::FUSE_MIN_READ_BUFFER);
 
-struct FuseData {
-    /// We're assuming that it's possible `fuse_session_process_buf` may trigger multiple
-    /// callbacks, so we need to enqueue them all,
-    ///
-    /// This is a `RefCell` since we're implementing `Stream` and therefore can only be polled by a
-    /// single thread at a time. The requests get pushed here, and then immediately yielded by the
-    /// `Stream::poll_next()` method.
-    pending_requests: RefCell<VecDeque<Request>>,
-
-    /// Set by 'destroy'.
-    finished: bool,
-
-    fbuf: Arc<sys::FuseBuf>,
-}
-
-unsafe impl Send for FuseData {}
-unsafe impl Sync for FuseData {}
-
-impl FuseData {
-    extern "C" fn destroy(userdata: sys::MutPtr) {
-        let fuse_data = unsafe { &mut *(userdata as *mut FuseData) };
-        fuse_data.finished = true;
-    }
-
-    extern "C" fn lookup(request: sys::Request, parent: u64, file_name: sys::StrPtr) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        let file_name = unsafe { CStr::from_ptr(file_name) };
-        let file_name = OsStr::from_bytes(file_name.to_bytes()).to_owned();
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Lookup(requests::Lookup {
-                request: RequestGuard::from_raw(request),
-                parent,
-                file_name,
-            }));
-    }
-
-    extern "C" fn forget(request: sys::Request, inode: u64, nlookup: u64) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Forget(requests::Forget {
-                request: RequestGuard::from_raw(request),
-                inode,
-                count: nlookup,
-            }));
-    }
-
-    extern "C" fn getattr(request: sys::Request, inode: u64, _file_info: *const sys::FuseFileInfo) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Getattr(requests::Getattr {
-                request: RequestGuard::from_raw(request),
-                inode,
-            }));
-    }
-
-    extern "C" fn statfs(request: sys::Request, inode: u64) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Statfs(requests::Statfs {
-                request: RequestGuard::from_raw(request),
-                inode,
-            }));
-    }
-
-    extern "C" fn readdir(
-        request: sys::Request,
-        inode: u64,
-        size: libc::size_t,
-        offset: libc::off_t,
-        _file_info: *const sys::FuseFileInfo,
-    ) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Readdir(requests::Readdir::new(
-                RequestGuard::from_raw(request),
-                inode,
-                size,
-                offset,
-            )));
-    }
-
-    extern "C" fn readdirplus(
-        request: sys::Request,
-        inode: u64,
-        size: libc::size_t,
-        offset: libc::off_t,
-        _file_info: *const sys::FuseFileInfo,
-    ) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::ReaddirPlus(requests::ReaddirPlus::new(
-                RequestGuard::from_raw(request),
-                inode,
-                size,
-                offset,
-            )));
-    }
-
-    extern "C" fn mkdir(
-        request: sys::Request,
-        parent: u64,
-        dir_name: sys::StrPtr,
-        mode: libc::mode_t,
-    ) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        let dir_name = unsafe { CStr::from_ptr(dir_name) };
-        let dir_name = OsStr::from_bytes(dir_name.to_bytes()).to_owned();
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Mkdir(requests::Mkdir {
-                request: RequestGuard::from_raw(request),
-                parent,
-                dir_name,
-                mode,
-            }));
-    }
-
-    extern "C" fn create(
-        request: sys::Request,
-        parent: u64,
-        file_name: sys::StrPtr,
-        mode: libc::mode_t,
-        file_info: *const sys::FuseFileInfo,
-    ) {
-        let (fuse_data, file_info, file_name) = unsafe {
-            (
-                &*(sys::fuse_req_userdata(request) as *mut FuseData),
-                &*file_info,
-                CStr::from_ptr(file_name),
-            )
-        };
-        let file_name = OsStr::from_bytes(file_name.to_bytes()).to_owned();
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Create(requests::Create {
-                request: RequestGuard::from_raw(request),
-                parent,
-                file_name,
-                mode,
-                file_info: file_info.clone(),
-            }));
-    }
-
-    extern "C" fn mknod(
-        request: sys::Request,
-        parent: u64,
-        file_name: sys::StrPtr,
-        mode: libc::mode_t,
-        dev: libc::dev_t,
-    ) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        let file_name = unsafe { CStr::from_ptr(file_name) };
-        let file_name = OsStr::from_bytes(file_name.to_bytes()).to_owned();
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Mknod(requests::Mknod {
-                request: RequestGuard::from_raw(request),
-                parent,
-                file_name,
-                mode,
-                dev,
-            }));
-    }
-
-    extern "C" fn open(request: sys::Request, inode: u64, file_info: *const sys::FuseFileInfo) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        let file_info = unsafe { std::ptr::read(file_info) };
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Open(requests::Open {
-                request: RequestGuard::from_raw(request),
-                inode,
-                flags: file_info.flags,
-                file_info,
-            }));
-    }
-
-    extern "C" fn release(request: sys::Request, inode: u64, file_info: *const sys::FuseFileInfo) {
-        let (fuse_data, file_info) = unsafe {
-            (
-                &*(sys::fuse_req_userdata(request) as *mut FuseData),
-                &*file_info,
-            )
-        };
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Release(requests::Release {
-                request: RequestGuard::from_raw(request),
-                inode,
-                flags: file_info.flags,
-                fh: file_info.fh,
-            }));
-    }
-
-    extern "C" fn read(
-        request: sys::Request,
-        inode: u64,
-        size: libc::size_t,
-        offset: libc::off_t,
-        file_info: *const sys::FuseFileInfo,
-    ) {
-        let (fuse_data, file_info) = unsafe {
-            (
-                &*(sys::fuse_req_userdata(request) as *mut FuseData),
-                &*file_info,
-            )
-        };
-        let offset = offset as u64;
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Read(requests::Read {
-                request: RequestGuard::from_raw(request),
-                fh: file_info.fh,
-                inode,
-                size,
-                offset,
-            }));
-    }
-
-    extern "C" fn readlink(request: sys::Request, inode: u64) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Readlink(requests::Readlink {
-                request: RequestGuard::from_raw(request),
-                inode,
-            }));
-    }
-
-    extern "C" fn setattr(
-        request: sys::Request,
-        inode: u64,
-        stat: *const libc::stat,
-        to_set: libc::c_int,
-        file_info: *const sys::FuseFileInfo,
-    ) {
-        let (fuse_data, stat, file_info) = unsafe {
-            (
-                &*(sys::fuse_req_userdata(request) as *mut FuseData),
-                &*stat,
-                if file_info.is_null() {
-                    None
-                } else {
-                    Some(&*file_info)
-                },
-            )
-        };
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Setattr(requests::Setattr {
-                request: RequestGuard::from_raw(request),
-                inode,
-                to_set,
-                stat: Stat::from(*stat),
-                fh: file_info.map(|fi| fi.fh),
-            }));
-    }
-
-    extern "C" fn unlink(request: sys::Request, parent: u64, file_name: sys::StrPtr) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        let file_name = unsafe { CStr::from_ptr(file_name) };
-        let file_name = OsStr::from_bytes(file_name.to_bytes()).to_owned();
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Unlink(requests::Unlink {
-                request: RequestGuard::from_raw(request),
-                parent,
-                file_name,
-            }));
-    }
-
-    extern "C" fn rmdir(request: sys::Request, parent: u64, dir_name: sys::StrPtr) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        let dir_name = unsafe { CStr::from_ptr(dir_name) };
-        let dir_name = OsStr::from_bytes(dir_name.to_bytes()).to_owned();
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Rmdir(requests::Rmdir {
-                request: RequestGuard::from_raw(request),
-                parent,
-                dir_name,
-            }));
-    }
-
-    extern "C" fn rename(
-        request: sys::Request,
-        parent: u64,
-        name: sys::StrPtr,
-        new_parent: u64,
-        new_name: sys::StrPtr,
-        flags: libc::c_int,
-    ) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        let name = unsafe { CStr::from_ptr(name) };
-        let name = OsStr::from_bytes(name.to_bytes()).to_owned();
-        let new_name = unsafe { CStr::from_ptr(new_name) };
-        let new_name = OsStr::from_bytes(new_name.to_bytes()).to_owned();
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Rename(requests::Rename {
-                request: RequestGuard::from_raw(request),
-                parent,
-                name,
-                new_parent,
-                new_name,
-                flags,
-            }));
-    }
-
-    extern "C" fn write(
-        request: sys::Request,
-        inode: u64,
-        buffer: *const u8,
-        size: libc::size_t,
-        offset: libc::off_t,
-        file_info: *const sys::FuseFileInfo,
-    ) {
-        let (fuse_data, file_info) = unsafe {
-            (
-                &*(sys::fuse_req_userdata(request) as *mut FuseData),
-                &*file_info,
-            )
-        };
-        let offset = offset as u64;
-        fuse_data
-            .pending_requests
-            .borrow_mut()
-            .push_back(Request::Write(requests::Write {
-                request: RequestGuard::from_raw(request),
-                fh: file_info.fh,
-                inode,
-                data: buffer,
-                size,
-                offset,
-                _buffer: Arc::clone(&fuse_data.fbuf),
-            }));
-    }
-
-    extern "C" fn listxattr(request: sys::Request, inode: u64, size: libc::size_t) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        fuse_data.pending_requests.borrow_mut().push_back({
-            if size == 0 {
-                Request::ListXAttrSize(requests::ListXAttrSize {
-                    request: RequestGuard::from_raw(request),
-                    inode,
-                })
-            } else {
-                Request::ListXAttr(requests::ListXAttr::new(
-                    RequestGuard::from_raw(request),
-                    inode,
-                    size,
-                ))
-            }
-        });
-    }
-
-    extern "C" fn getxattr(
-        request: sys::Request,
-        inode: u64,
-        attr_name: sys::StrPtr,
-        size: libc::size_t,
-    ) {
-        let fuse_data = unsafe { &*(sys::fuse_req_userdata(request) as *mut FuseData) };
-        let attr_name = unsafe { CStr::from_ptr(attr_name) };
-        let attr_name = OsStr::from_bytes(attr_name.to_bytes()).to_owned();
-        fuse_data.pending_requests.borrow_mut().push_back({
-            if size == 0 {
-                Request::GetXAttrSize(requests::GetXAttrSize {
-                    request: RequestGuard::from_raw(request),
-                    inode,
-                    attr_name,
-                })
-            } else {
-                Request::GetXAttr(requests::GetXAttr {
-                    request: RequestGuard::from_raw(request),
-                    inode,
-                    attr_name,
-                    size,
-                })
-            }
-        });
-    }
+/// Bitflags tracking which operations are enabled.
+#[derive(Clone, Copy, Default)]
+struct EnabledOps {
+    lookup: bool,
+    forget: bool,
+    getattr: bool,
+    setattr: bool,
+    statfs: bool,
+    readdir: bool,
+    readdirplus: bool,
+    mkdir: bool,
+    create: bool,
+    mknod: bool,
+    open: bool,
+    release: bool,
+    read: bool,
+    write: bool,
+    unlink: bool,
+    rmdir: bool,
+    rename: bool,
+    readlink: bool,
+    listxattr: bool,
+    getxattr: bool,
 }
 
 pub struct FuseSessionBuilder {
-    args: Vec<CString>,
-    has_debug: bool,
-    operations: sys::Operations,
+    name: String,
+    options: Vec<String>,
+    ops: EnabledOps,
 }
 
 impl FuseSessionBuilder {
-    pub fn options(self, option: &str) -> Result<Self, Error> {
-        Ok(self.options_c(
-            CString::new(option).map_err(|err| format_err!("bad option string: {}", err))?,
-        ))
+    pub fn options(mut self, option: &str) -> Self {
+        self.options.push(option.to_string());
+        self
     }
 
     pub fn options_os(self, option: &OsStr) -> Result<Self, Error> {
-        Ok(self.options_c(
-            CString::new(option.as_bytes())
-                .map_err(|err| format_err!("bad option string: {}", err))?,
-        ))
+        let s = option
+            .to_str()
+            .ok_or_else(|| format_err!("option is not valid UTF-8"))?;
+        Ok(self.options(s))
     }
 
-    pub fn options_c(mut self, option: CString) -> Self {
-        self.args.reserve(2);
-        self.args.push(CString::new("-o").unwrap());
-        self.args.push(option);
-        self
+    pub fn options_c(self, option: std::ffi::CString) -> Result<Self, Error> {
+        let s = option
+            .to_str()
+            .map_err(|_| format_err!("option is not valid UTF-8"))?;
+        Ok(self.options(s))
     }
 
-    pub fn debug(mut self) -> Self {
-        if !self.has_debug {
-            self.args.push(CString::new("--debug").unwrap());
+    pub fn build(self) -> FuseSession {
+        FuseSession {
+            name: self.name,
+            options: self.options,
+            ops: self.ops,
         }
-        self
-    }
-
-    pub fn build(self) -> Result<FuseSession, Error> {
-        let args: Vec<*const libc::c_char> = self.args.iter().map(|cstr| cstr.as_ptr()).collect();
-
-        let fuse_data = Box::new(FuseData {
-            pending_requests: RefCell::new(VecDeque::new()),
-            finished: false,
-            fbuf: Arc::new(sys::FuseBuf::new()),
-        });
-        let session = unsafe {
-            sys::fuse_session_new(
-                Some(&sys::FuseArgs::from(&args[..])),
-                Some(&self.operations),
-                mem::size_of_val(&self.operations),
-                fuse_data.as_ref() as *const FuseData as sys::ConstPtr,
-            )
-        };
-        drop(args);
-
-        if session.is_null() {
-            bail!("failed to create fuse session");
-        }
-
-        Ok(FuseSession {
-            session,
-            fuse_data: Some(fuse_data),
-            mounted: false,
-        })
     }
 
     /// Enable `Readdir` requests.
     pub fn enable_readdir(mut self) -> Self {
-        self.operations.readdir = Some(FuseData::readdir);
+        self.ops.readdir = true;
         self
     }
 
     /// Enables all of `ReaddirPlus`, `Lookup` and `Forget` requests.
-    ///
-    /// The `Lookup` and `Forget` requests are required for reference counting implied by
-    /// `ReaddirPlus`. The kernel should send `Forget` requests for references created via
-    /// `ReaddirPlus`. Not handling them wouldn't make much sense.
     pub fn enable_readdirplus(mut self) -> Self {
-        self.operations.readdirplus = Some(FuseData::readdirplus);
+        self.ops.readdirplus = true;
         self
     }
 
     /// Enable `Mkdir` requests.
-    ///
-    /// Note that the lookup count of newly created directory should be 1.
     pub fn enable_mkdir(mut self) -> Self {
-        self.operations.mkdir = Some(FuseData::mkdir);
+        self.ops.mkdir = true;
         self
     }
 
     /// Enable `Create`, `Open` and `Release` requests.
-    ///
-    /// Create and open a file.
     pub fn enable_create(mut self) -> Self {
-        self.operations.create = Some(FuseData::create);
+        self.ops.create = true;
         self.enable_open()
     }
 
     /// Enable `Mknod`.
-    ///
-    /// This may be used by the kernel instead of `Create`.
     pub fn enable_mknod(mut self) -> Self {
-        self.operations.mknod = Some(FuseData::mknod);
+        self.ops.mknod = true;
         self
     }
 
     /// Enable `Open` requests.
-    ///
-    /// Open a file.
     pub fn enable_open(mut self) -> Self {
-        self.operations.open = Some(FuseData::open);
-        self.operations.release = Some(FuseData::release);
+        self.ops.open = true;
+        self.ops.release = true;
         self
     }
 
     /// Enable `Setattr` requests.
     pub fn enable_setattr(mut self) -> Self {
-        self.operations.setattr = Some(FuseData::setattr);
+        self.ops.setattr = true;
         self
     }
 
     /// Enable `Statfs` requests.
     pub fn enable_statfs(mut self) -> Self {
-        self.operations.statfs = Some(FuseData::statfs);
+        self.ops.statfs = true;
         self
     }
 
     /// Enable `Unlink` requests.
     pub fn enable_unlink(mut self) -> Self {
-        self.operations.unlink = Some(FuseData::unlink);
+        self.ops.unlink = true;
         self
     }
 
     /// Enable `Rmdir` requests.
     pub fn enable_rmdir(mut self) -> Self {
-        self.operations.rmdir = Some(FuseData::rmdir);
+        self.ops.rmdir = true;
         self
     }
 
     /// Enable `Rename` requests.
     pub fn enable_rename(mut self) -> Self {
-        self.operations.rename = Some(FuseData::rename);
+        self.ops.rename = true;
         self
     }
 
     /// Enable `Read` requests.
     pub fn enable_read(mut self) -> Self {
-        self.operations.read = Some(FuseData::read);
+        self.ops.read = true;
         self
     }
 
     /// Enable `Write` requests.
     pub fn enable_write(mut self) -> Self {
-        self.operations.write = Some(FuseData::write);
+        self.ops.write = true;
         self
     }
 
     /// Enable `Readlink` requests.
     pub fn enable_readlink(mut self) -> Self {
-        self.operations.readlink = Some(FuseData::readlink);
+        self.ops.readlink = true;
         self
     }
 
-    /// Enable requests to list extended attributes:
-    ///
-    /// * `ListXAttrSize`
-    /// * `ListXAttr`
-    /// * `GetXAttrSize`
-    /// * `GetXAttr`
+    /// Enable requests to list extended attributes.
     pub fn enable_read_xattr(mut self) -> Self {
-        self.operations.listxattr = Some(FuseData::listxattr);
-        self.operations.getxattr = Some(FuseData::getxattr);
+        self.ops.listxattr = true;
+        self.ops.getxattr = true;
         self
     }
 }
 
 pub struct FuseSession {
-    session: sys::MutPtr,
-    fuse_data: Option<Box<FuseData>>,
-    mounted: bool,
-}
-
-impl Drop for FuseSession {
-    fn drop(&mut self) {
-        unsafe {
-            if self.mounted {
-                sys::fuse_session_unmount(self.session);
-            }
-
-            if !self.session.is_null() {
-                sys::fuse_session_destroy(self.session);
-            }
-        }
-    }
+    name: String,
+    options: Vec<String>,
+    ops: EnabledOps,
 }
 
 impl FuseSession {
-    pub fn mount(mut self, mountpoint: &Path) -> Result<Fuse, Error> {
-        let mountpoint = mountpoint.canonicalize()?;
-        let mountpoint = CString::new(mountpoint.as_os_str().as_bytes())
-            .map_err(|err| format_err!("bad path for mount point: {}", err))?;
+    /// Mount a FUSE filesystem at `mountpoint`.
+    ///
+    /// This function is **blocking** — it spawns `fusermount3` as a child process and waits for
+    /// it to complete, then performs several synchronous syscalls (fcntl, socketpair, recvmsg)
+    /// before returning. It also requires an active tokio runtime context, because the returned
+    /// [`Fuse`] registers the FUSE fd with the tokio reactor via `AsyncFd`, which panics if no
+    /// runtime handle is available.
+    ///
+    /// When calling from an async task, use [`mount_async`](Self::mount_async) instead to avoid
+    /// blocking the runtime worker on the child-process wait.
+    pub fn mount(self, mountpoint: &Path) -> Result<Fuse, Error> {
+        let mountpoint_buf = mountpoint
+            .canonicalize()
+            .map_err(|e| format_err!("bad mount point: {e}"))?;
 
-        let rc = unsafe { sys::fuse_session_mount(self.session, mountpoint.as_ptr()) };
-        if rc != 0 {
-            bail!("mount failed");
+        let fuse_fd = mount::fuse_mount(&mountpoint_buf, &self.name, &self.options)
+            .map_err(|e| format_err!("mount failed: {e}"))?;
+
+        // SAFETY: fuse_fd is a valid, open file descriptor; F_GETFL/F_SETFL are valid fcntl ops.
+        unsafe {
+            let flags = libc::fcntl(fuse_fd.as_raw_fd(), libc::F_GETFL);
+            if flags == -1 {
+                bail!("fcntl(F_GETFL) failed: {}", io::Error::last_os_error());
+            }
+            let rc = libc::fcntl(fuse_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+            if rc == -1 {
+                bail!("fcntl(F_SETFL) failed: {}", io::Error::last_os_error());
+            }
         }
-        self.mounted = true;
 
-        let fd = unsafe { sys::fuse_session_fd(self.session) };
-        if fd < 0 {
-            bail!("failed to get fuse session file descriptor");
-        }
+        // Register the FUSE fd with tokio for both read-readiness and error events. The
+        // error-event registration is what lets the reactor deliver EPOLLERR to us — which is
+        // how the kernel signals that the FUSE connection has been torn down
+        // (fusermount3 -u, /sys/fs/fuse/connections/N/abort, etc.).
+        //
+        // `poll_read_ready` only wakes on READABLE-direction events, so we spawn a short tokio
+        // task that awaits `ready(Interest::ERROR)`. The task and `poll_next` share the same
+        // `AsyncFd` via `Arc` — the two use disjoint waker mechanisms inside `ScheduledIo`
+        // (fixed read waker slot vs. the async-path waiter linked list), so they don't clobber
+        // each other. `poll_next` observes unmount by polling the watcher's `JoinHandle`
+        // directly: completion (POLLERR observed) or abort from `Drop` both show up as a
+        // ready result, which is all we need.
+        let async_fd = Arc::new(
+            AsyncFd::with_interest(Arc::new(fuse_fd), Interest::READABLE | Interest::ERROR)
+                .map_err(|e| format_err!("failed to register fuse fd with tokio: {e}"))?,
+        );
 
-        let fuse_fd = FuseFd::from_raw(fd)?;
+        let err_fd = Arc::clone(&async_fd);
+        let err_watcher = tokio::spawn(async move {
+            // The return value is intentionally ignored: any outcome — success, reactor
+            // shutdown, or the task being aborted from `Fuse::drop` — means this task is
+            // done, which is exactly the signal `poll_next` is looking for.
+            let _ = err_fd.ready(Interest::ERROR).await;
+        });
 
-        // disable mount guard
-        self.mounted = false;
         Ok(Fuse {
-            session: SessionPtr(unsafe {
-                NonNull::new_unchecked(mem::replace(&mut self.session, ptr::null_mut()))
-            }),
-            fuse_data: self.fuse_data.take().unwrap(),
-            fuse_fd,
+            async_fd,
+            mountpoint: mountpoint_buf,
+            ops: self.ops,
+            buf: Arc::new(vec![0u8; READ_BUF_SIZE]),
+            pending: VecDeque::new(),
+            init_done: false,
+            finished: false,
+            err_watcher,
         })
     }
-}
 
-/// Wrap only the session pointer so we can catch auto-trait impl failures for cfuse_data and
-/// fuse_fd.
-struct SessionPtr(NonNull<libc::c_void>);
-
-impl SessionPtr {
-    #[inline]
-    fn as_ptr(&self) -> sys::MutPtr {
-        (self.0).as_ptr()
+    /// Async wrapper around [`mount`](Self::mount).
+    ///
+    /// `mount()` is blocking; this wrapper runs it on tokio's blocking thread pool via
+    /// [`tokio::task::spawn_blocking`] so that calling it from an async task does not stall the
+    /// runtime. The blocking thread inherits the current runtime handle, so `AsyncFd` registration
+    /// inside `mount()` still works correctly.
+    pub async fn mount_async(self, mountpoint: &Path) -> Result<Fuse, Error> {
+        let mountpoint = mountpoint.to_owned();
+        tokio::task::spawn_blocking(move || self.mount(&mountpoint))
+            .await
+            .map_err(|e| format_err!("mount task panicked: {e}"))?
     }
 }
-
-unsafe impl Send for SessionPtr {}
-unsafe impl Sync for SessionPtr {}
 
 /// A mounted fuse file system.
 ///
-/// This is a stream yielding `Request`s. The kind of requests this the stream will see depends on
-/// the settings chosen when setting up the `FuseSession` via the `FuseSessionBuilder`.
-///
-/// By default, the following are enabled:
-/// * `Lookup`
-/// * `Forget`
-/// * `Getattr`
+/// This is a stream yielding `Request`s.
 pub struct Fuse {
-    session: SessionPtr,
-    fuse_data: Box<FuseData>,
-    fuse_fd: FuseFd,
+    async_fd: Arc<AsyncFd<Arc<OwnedFd>>>,
+    mountpoint: PathBuf,
+    ops: EnabledOps,
+    buf: Arc<Vec<u8>>,
+    pending: VecDeque<Request>,
+    init_done: bool,
+    finished: bool,
+    /// Tokio task awaiting `ready(Interest::ERROR)` on the FUSE fd. Completion of this
+    /// handle — whether the task ran to completion after POLLERR or was aborted by `Drop` —
+    /// is the signal `poll_next` uses to terminate the stream.
+    err_watcher: tokio::task::JoinHandle<()>,
 }
-
-// We lose these via the raw session pointer:
-impl Unpin for Fuse {}
 
 impl Drop for Fuse {
     fn drop(&mut self) {
-        unsafe {
-            sys::fuse_session_unmount(self.session.as_ptr());
-            sys::fuse_session_destroy(self.session.as_ptr());
+        // Cancel the POLLERR watcher task so it cannot outlive this struct and so it releases
+        // its clone of the `Arc<AsyncFd>` promptly. `abort()` is non-blocking — it signals the
+        // runtime to drop the task at its next await point.
+        self.err_watcher.abort();
+        // Fast path: a single `umount2(MNT_DETACH)` syscall. Returns instantly and does not
+        // block. Succeeds whenever the caller holds CAP_SYS_ADMIN in the mount's user namespace
+        // — in practice, every Proxmox deployment (which runs as root) always takes this path.
+        match mount::umount2_detach(&self.mountpoint) {
+            Ok(()) => {}
+            // EPERM means the caller lacks CAP_SYS_ADMIN (unprivileged user in the init
+            // namespace, mount was created via the setuid fusermount3 helper). Fall back to
+            // the setuid helper itself — but on a detached thread, so `Drop` never blocks the
+            // async runtime on the subprocess wait.
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                let mountpoint = std::mem::take(&mut self.mountpoint);
+                std::thread::spawn(move || {
+                    let _ = mount::fuse_unmount_via_helper(&mountpoint);
+                });
+            }
+            // Any other error (EINVAL, ENOENT, EBUSY, …) means the mount is already gone or
+            // the kernel refused for a reason the helper cannot work around either. Nothing
+            // more we can usefully do from `Drop`.
+            Err(_) => {}
         }
     }
 }
 
 impl Fuse {
-    pub fn builder(name: &str) -> Result<FuseSessionBuilder, Error> {
-        let name = CString::new(name).map_err(|err| format_err!("bad name: {}", err))?;
+    pub fn builder(name: &str) -> FuseSessionBuilder {
+        FuseSessionBuilder {
+            name: name.to_string(),
+            options: Vec::new(),
+            ops: EnabledOps {
+                lookup: true,
+                forget: true,
+                getattr: true,
+                ..Default::default()
+            },
+        }
+    }
 
-        Ok(FuseSessionBuilder {
-            args: vec![name],
-            has_debug: false,
-            operations: DEFAULT_OPERATIONS,
-        })
+    /// Process one request from the buffer.
+    ///
+    /// Takes `buf` as a separate `Arc` to avoid borrow conflicts with `&mut self`.
+    fn process_request(&mut self, buf: &Arc<Vec<u8>>, nbytes: usize) -> io::Result<()> {
+        if nbytes < mem::size_of::<FuseInHeader>() {
+            return Err(io::Error::other("short read from /dev/fuse"));
+        }
+
+        let header: FuseInHeader = read_body(&buf[..nbytes])?;
+
+        if header.len as usize != nbytes {
+            return Err(io::Error::other(format!(
+                "FUSE header.len ({}) does not match read size ({})",
+                header.len, nbytes,
+            )));
+        }
+
+        let body = &buf[mem::size_of::<FuseInHeader>()..nbytes];
+
+        if !self.init_done {
+            return self.handle_init(&header, body);
+        }
+
+        let fd = Arc::clone(self.async_fd.get_ref());
+        let guard = RequestGuard::new(header.unique, fd);
+
+        let Some(opcode) = Opcode::from_u32(header.opcode) else {
+            // Unknown opcode — the guard will reply ENOSYS on drop.
+            return Ok(());
+        };
+
+        match opcode {
+            Opcode::Destroy => {
+                guard.disarm();
+                self.finished = true;
+            }
+            Opcode::Interrupt => {
+                // Let the guard's Drop send -ENOSYS. The kernel treats that as
+                // "daemon cannot handle interrupts", sets fc->no_interrupt = 1
+                // (see fs/fuse/dev.c:2231), and stops sending FUSE_INTERRUPT.
+            }
+            Opcode::Lookup if self.ops.lookup => {
+                self.pending.push_back(Request::Lookup(requests::Lookup {
+                    request: guard,
+                    parent: header.nodeid,
+                    file_name: protocol::name_from_bytes(body).to_owned(),
+                }));
+            }
+            Opcode::Forget => {
+                // FUSE_FORGET must never receive a reply — handle unconditionally.
+                let forget_in: protocol::FuseForgetIn = read_body(body)?;
+                if self.ops.forget {
+                    self.pending.push_back(Request::Forget(requests::Forget {
+                        request: guard,
+                        inode: header.nodeid,
+                        count: forget_in.nlookup,
+                    }));
+                } else {
+                    guard.disarm();
+                }
+            }
+            Opcode::BatchForget => {
+                // FUSE_BATCH_FORGET must never receive a reply.
+                guard.disarm();
+                if self.ops.forget {
+                    let batch_in: protocol::FuseBatchForgetIn = read_body(body)?;
+                    let entries_start = mem::size_of::<protocol::FuseBatchForgetIn>();
+                    let entry_size = mem::size_of::<protocol::FuseForgetOne>();
+                    for i in 0..batch_in.count as usize {
+                        let off = entries_start + i * entry_size;
+                        if off + entry_size > body.len() {
+                            break;
+                        }
+                        let entry: protocol::FuseForgetOne = read_body(&body[off..])?;
+                        let fd = Arc::clone(self.async_fd.get_ref());
+                        let forget_guard = RequestGuard::new(0, fd);
+                        self.pending.push_back(Request::Forget(requests::Forget {
+                            request: forget_guard,
+                            inode: entry.nodeid,
+                            count: entry.nlookup,
+                        }));
+                    }
+                }
+            }
+            Opcode::Getattr if self.ops.getattr => {
+                self.pending.push_back(Request::Getattr(requests::Getattr {
+                    request: guard,
+                    inode: header.nodeid,
+                }));
+            }
+            Opcode::Setattr if self.ops.setattr => {
+                let setattr_in: protocol::FuseSetattrIn = read_body(body)?;
+                let valid = protocol::FattrFlags::from_bits_truncate(setattr_in.valid);
+                let fh = valid
+                    .contains(protocol::FattrFlags::FH)
+                    .then_some(setattr_in.fh);
+                self.pending.push_back(Request::Setattr(requests::Setattr {
+                    request: guard,
+                    inode: header.nodeid,
+                    to_set: valid,
+                    stat: Stat::from(setattr_in.to_stat()),
+                    fh,
+                }));
+            }
+            Opcode::Statfs if self.ops.statfs => {
+                self.pending.push_back(Request::Statfs(requests::Statfs {
+                    request: guard,
+                    inode: header.nodeid,
+                }));
+            }
+            Opcode::Readlink if self.ops.readlink => {
+                self.pending.push_back(Request::Readlink(requests::Readlink {
+                    request: guard,
+                    inode: header.nodeid,
+                }));
+            }
+            Opcode::Mknod if self.ops.mknod => {
+                let mknod_in: protocol::FuseMknodIn = read_body(body)?;
+                let file_name = protocol::name_after::<protocol::FuseMknodIn>(body)?.to_owned();
+                self.pending.push_back(Request::Mknod(requests::Mknod {
+                    request: guard,
+                    parent: header.nodeid,
+                    file_name,
+                    mode: mknod_in.mode,
+                    dev: mknod_in.rdev as libc::dev_t,
+                }));
+            }
+            Opcode::Mkdir if self.ops.mkdir => {
+                let mkdir_in: protocol::FuseMkdirIn = read_body(body)?;
+                let dir_name = protocol::name_after::<protocol::FuseMkdirIn>(body)?.to_owned();
+                self.pending.push_back(Request::Mkdir(requests::Mkdir {
+                    request: guard,
+                    parent: header.nodeid,
+                    dir_name,
+                    mode: mkdir_in.mode,
+                }));
+            }
+            Opcode::Unlink if self.ops.unlink => {
+                self.pending.push_back(Request::Unlink(requests::Unlink {
+                    request: guard,
+                    parent: header.nodeid,
+                    file_name: protocol::name_from_bytes(body).to_owned(),
+                }));
+            }
+            Opcode::Rmdir if self.ops.rmdir => {
+                self.pending.push_back(Request::Rmdir(requests::Rmdir {
+                    request: guard,
+                    parent: header.nodeid,
+                    dir_name: protocol::name_from_bytes(body).to_owned(),
+                }));
+            }
+            Opcode::Rename2 if self.ops.rename => {
+                let rename_in: protocol::FuseRename2In = read_body(body)?;
+                let (name, new_name) = protocol::two_names_after::<protocol::FuseRename2In>(body)?;
+                self.pending.push_back(Request::Rename(requests::Rename {
+                    request: guard,
+                    parent: header.nodeid,
+                    name: name.to_owned(),
+                    new_parent: rename_in.newdir,
+                    new_name: new_name.to_owned(),
+                    flags: rename_in.flags as libc::c_int,
+                }));
+            }
+            Opcode::Open if self.ops.open => {
+                let open_in: protocol::FuseOpenIn = read_body(body)?;
+                self.pending.push_back(Request::Open(requests::Open {
+                    request: guard,
+                    inode: header.nodeid,
+                    flags: open_in.flags as libc::c_int,
+                    file_info: FuseFileInfo::default(),
+                }));
+            }
+            Opcode::Release if self.ops.release => {
+                let release_in: protocol::FuseReleaseIn = read_body(body)?;
+                self.pending.push_back(Request::Release(requests::Release {
+                    request: guard,
+                    inode: header.nodeid,
+                    fh: release_in.fh,
+                    flags: release_in.flags as libc::c_int,
+                }));
+            }
+            Opcode::Read if self.ops.read => {
+                let read_in: protocol::FuseReadIn = read_body(body)?;
+                self.pending.push_back(Request::Read(requests::Read {
+                    request: guard,
+                    inode: header.nodeid,
+                    fh: read_in.fh,
+                    size: read_in.size as usize,
+                    offset: read_in.offset,
+                }));
+            }
+            Opcode::Write if self.ops.write => {
+                let write_in: protocol::FuseWriteIn = read_body(body)?;
+                let data_offset =
+                    mem::size_of::<FuseInHeader>() + mem::size_of::<protocol::FuseWriteIn>();
+                let data_end = data_offset
+                    .checked_add(write_in.size as usize)
+                    .ok_or_else(|| io::Error::other("FUSE write size overflows"))?;
+                if data_end > nbytes {
+                    return Err(io::Error::other(format!(
+                        "FUSE write claims {} data bytes but message is only {} bytes",
+                        write_in.size, nbytes,
+                    )));
+                }
+                self.pending.push_back(Request::Write(requests::Write::new(
+                    guard,
+                    header.nodeid,
+                    write_in.fh,
+                    data_offset,
+                    write_in.size as usize,
+                    write_in.offset,
+                    Arc::clone(buf),
+                )));
+            }
+            Opcode::Create if self.ops.create => {
+                let create_in: protocol::FuseCreateIn = read_body(body)?;
+                let file_name = protocol::name_after::<protocol::FuseCreateIn>(body)?.to_owned();
+                self.pending.push_back(Request::Create(requests::Create {
+                    request: guard,
+                    parent: header.nodeid,
+                    file_name,
+                    mode: create_in.mode,
+                    file_info: FuseFileInfo::default(),
+                }));
+            }
+            Opcode::Readdir if self.ops.readdir => {
+                let read_in: protocol::FuseReadIn = read_body(body)?;
+                self.pending.push_back(Request::Readdir(requests::Readdir::new(
+                    guard,
+                    header.nodeid,
+                    read_in.size as usize,
+                    read_in.offset,
+                )));
+            }
+            Opcode::Readdirplus if self.ops.readdirplus => {
+                let read_in: protocol::FuseReadIn = read_body(body)?;
+                self.pending.push_back(Request::ReaddirPlus(requests::ReaddirPlus::new(
+                    guard,
+                    header.nodeid,
+                    read_in.size as usize,
+                    read_in.offset,
+                )));
+            }
+            Opcode::Listxattr if self.ops.listxattr => {
+                let getxattr_in: protocol::FuseGetxattrIn = read_body(body)?;
+                if getxattr_in.size == 0 {
+                    self.pending.push_back(Request::ListXAttrSize(requests::ListXAttrSize {
+                        request: guard,
+                        inode: header.nodeid,
+                    }));
+                } else {
+                    self.pending.push_back(Request::ListXAttr(requests::ListXAttr::new(
+                        guard,
+                        header.nodeid,
+                        getxattr_in.size as usize,
+                    )));
+                }
+            }
+            Opcode::Getxattr if self.ops.getxattr => {
+                let getxattr_in: protocol::FuseGetxattrIn = read_body(body)?;
+                let attr_name = protocol::name_after::<protocol::FuseGetxattrIn>(body)?.to_owned();
+                if getxattr_in.size == 0 {
+                    self.pending.push_back(Request::GetXAttrSize(requests::GetXAttrSize {
+                        request: guard,
+                        inode: header.nodeid,
+                        attr_name,
+                    }));
+                } else {
+                    self.pending.push_back(Request::GetXAttr(requests::GetXAttr {
+                        request: guard,
+                        inode: header.nodeid,
+                        attr_name,
+                        size: getxattr_in.size as usize,
+                    }));
+                }
+            }
+            _ => {
+                // Guard drop sends ENOSYS.
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_init(&mut self, header: &FuseInHeader, body: &[u8]) -> io::Result<()> {
+        let opcode = Opcode::from_u32(header.opcode);
+        if opcode != Some(Opcode::Init) {
+            return Err(io::Error::other(format!(
+                "expected FUSE_INIT, got opcode {}",
+                header.opcode
+            )));
+        }
+
+        let init_in: FuseInitIn = read_body(body)?;
+
+        if init_in.major != protocol::FUSE_KERNEL_VERSION {
+            return Err(io::Error::other(format!(
+                "unsupported FUSE protocol major version: {} (expected {})",
+                init_in.major,
+                protocol::FUSE_KERNEL_VERSION
+            )));
+        }
+
+        let init_out = negotiate_init(&init_in, &self.ops);
+
+        let fd = self.async_fd.as_raw_fd();
+        requests::send_reply(fd, header.unique, 0, requests::as_bytes(&init_out))?;
+
+        self.init_done = true;
+        Ok(())
     }
 }
 
@@ -723,51 +652,146 @@ impl Stream for Fuse {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
-            if let Some(request) = this.fuse_data.pending_requests.borrow_mut().pop_front() {
+            if let Some(request) = this.pending.pop_front() {
                 return Poll::Ready(Some(Ok(request)));
             }
 
-            if this.fuse_data.finished {
+            if this.finished {
                 return Poll::Ready(None);
             }
 
-            let mut ready_guard = ready!(this.fuse_fd.poll_read_ready(cx))?;
+            // Check if the POLLERR watcher task has finished. `JoinHandle` is a `Future`, and
+            // `is_ready()` covers both the normal case (task observed POLLERR and returned)
+            // and the aborted case (yields `Err(JoinError)`) — either way, we terminate.
+            // Setting `finished = true` below prevents us from polling the handle again.
+            if Pin::new(&mut this.err_watcher).poll(cx).is_ready() {
+                this.finished = true;
+                return Poll::Ready(None);
+            }
 
-            let buf: &mut sys::FuseBuf = match Arc::get_mut(&mut this.fuse_data.fbuf) {
-                Some(buf) => buf,
-                None => {
-                    this.fuse_data.fbuf = Arc::new(sys::FuseBuf::new());
-                    // we literally just did Arc::new()
-                    Arc::get_mut(&mut this.fuse_data.fbuf).unwrap()
+            let mut ready_guard = ready!(this.async_fd.poll_read_ready(cx))?;
+
+            // If the buffer is still shared with outstanding Write requests (which borrow data
+            // from it via Arc), allocate a fresh one instead of clobbering the in-flight data.
+            if Arc::get_mut(&mut this.buf).is_none() {
+                this.buf = Arc::new(vec![0u8; READ_BUF_SIZE]);
+            }
+            let buf = Arc::get_mut(&mut this.buf).unwrap();
+            let buf_ptr = buf.as_mut_ptr() as *mut libc::c_void;
+            let buf_len = buf.len();
+
+            // `try_io` runs the closure and automatically calls `clear_ready()` on the guard if
+            // the syscall returns `WouldBlock` (EAGAIN). This is the tokio-idiomatic way to
+            // combine `AsyncFd` readiness notification with a direct syscall.
+            let read_result = ready_guard.try_io(|inner| {
+                let rc = unsafe { libc::read(inner.as_raw_fd(), buf_ptr, buf_len) };
+                if rc < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(rc as usize)
                 }
-            };
+            });
 
-            let rc = unsafe { sys::fuse_session_receive_buf(this.session.as_ptr(), Some(buf)) };
-
-            if rc == -libc::EAGAIN {
-                ready_guard.clear_ready();
-                if ready_guard.is_unmounted() || ready_guard.is_eof() {
-                    this.fuse_data.finished = true;
+            let nbytes = match read_result {
+                // try_io detected EAGAIN and already called clear_ready; loop to re-poll.
+                Err(_would_block) => continue,
+                Ok(Ok(0)) => {
+                    this.finished = true;
                     return Poll::Ready(None);
                 }
-                continue;
-            } else if rc < 0 {
-                return Poll::Ready(Some(Err(io::Error::from_raw_os_error(-rc))));
-            } else if rc == 0 {
-                this.fuse_data.finished = true;
-                return Poll::Ready(None);
-            }
+                Ok(Ok(n)) => n,
+                Ok(Err(err)) => match err.raw_os_error() {
+                    // ENODEV: kernel closed the connection (normal fusermount3 -u).
+                    // ECONNABORTED: connection aborted via /sys/fs/fuse/connections/<id>/abort.
+                    Some(libc::ENODEV | libc::ECONNABORTED) => {
+                        this.finished = true;
+                        return Poll::Ready(None);
+                    }
+                    _ => return Poll::Ready(Some(Err(err))),
+                },
+            };
 
-            unsafe {
-                sys::fuse_session_process_buf(this.session.as_ptr(), Some(buf));
+            let buf_ref = Arc::clone(&this.buf);
+            drop(ready_guard);
+            if let Err(err) = this.process_request(&buf_ref, nbytes) {
+                return Poll::Ready(Some(Err(err)));
             }
-            // and try again:
         }
     }
 }
 
 impl FusedStream for Fuse {
     fn is_terminated(&self) -> bool {
-        self.fuse_data.finished
+        self.finished
     }
 }
+
+/// Build a `FuseInitOut` reply from the kernel's `FuseInitIn` and our enabled operations.
+fn negotiate_init(init_in: &FuseInitIn, ops: &EnabledOps) -> FuseInitOut {
+    use protocol::InitFlags;
+
+    let minor = init_in.minor.min(protocol::FUSE_KERNEL_MINOR_VERSION);
+
+    let mut flags = InitFlags::ASYNC_READ
+        | InitFlags::BIG_WRITES
+        | InitFlags::ATOMIC_O_TRUNC
+        // We never handle FUSE_OPENDIR; advertise this so the kernel skips it
+        // entirely for every directory open instead of burning one ENOSYS
+        // round-trip per mount.
+        | InitFlags::NO_OPENDIR_SUPPORT;
+    if ops.readdirplus {
+        flags |= InitFlags::DO_READDIRPLUS | InitFlags::READDIRPLUS_AUTO;
+    }
+    if !ops.open {
+        // Daemon does not implement FUSE_OPEN: tell the kernel not to send it.
+        flags |= InitFlags::NO_OPEN_SUPPORT;
+    }
+
+    let kernel_flags = InitFlags::from_bits_truncate(init_in.flags);
+    let max_pages = if kernel_flags.contains(InitFlags::MAX_PAGES) {
+        // SAFETY: _SC_PAGESIZE is a valid sysconf name; always succeeds on Linux.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size > 0 {
+            flags |= InitFlags::MAX_PAGES;
+            (MAX_WRITE / page_size as usize) as u16
+        } else {
+            0 // sysconf failed; skip MAX_PAGES negotiation
+        }
+    } else {
+        0
+    };
+
+    let flags = flags & kernel_flags;
+
+    FuseInitOut {
+        major: protocol::FUSE_KERNEL_VERSION,
+        minor,
+        max_readahead: init_in.max_readahead,
+        flags: flags.bits(),
+        max_background: 0,
+        congestion_threshold: 0,
+        max_write: MAX_WRITE as u32,
+        time_gran: 1,
+        max_pages,
+        map_alignment: 0,
+        flags2: 0,
+        max_stack_depth: 0,
+        request_timeout: 0,
+        unused: [0; 11],
+    }
+}
+
+/// Read a `repr(C)` struct from a byte buffer.
+fn read_body<T: Copy>(body: &[u8]) -> io::Result<T> {
+    if body.len() < mem::size_of::<T>() {
+        return Err(io::Error::other(format!(
+            "truncated FUSE message: expected {} bytes, got {}",
+            mem::size_of::<T>(),
+            body.len(),
+        )));
+    }
+    // SAFETY: we verified body.len() >= size_of::<T>() above; read_unaligned handles
+    // the fact that body.as_ptr() may not be aligned for T.
+    Ok(unsafe { (body.as_ptr() as *const T).read_unaligned() })
+}
+
