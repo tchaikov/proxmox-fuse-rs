@@ -1,11 +1,12 @@
-pub(crate) mod fuse_fd;
+pub(crate) mod mount;
+pub(crate) mod protocol;
 pub mod requests;
 pub(crate) mod session;
-pub(crate) mod sys;
+pub mod sys;
 pub(crate) mod util;
 
 #[doc(inline)]
-pub use sys::{EntryParam, ROOT_ID, ReplyBufState};
+pub use sys::{EntryParam, FattrFlags, ROOT_ID, ReplyBufState};
 
 #[doc(inline)]
 pub use requests::{ReplyError, Request};

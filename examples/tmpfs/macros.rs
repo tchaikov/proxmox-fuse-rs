@@ -1,6 +1,6 @@
 macro_rules! io_format_err {
     ($($fmt:tt)*) => {
-        ::std::io::Error::new(::std::io::ErrorKind::Other, format!($($fmt)*))
+        ::std::io::Error::other(format!($($fmt)*))
     }
 }
 

@@ -7,16 +7,12 @@ Build-Depends-Arch: cargo:native <!nocheck>,
  rustc:native <!nocheck>,
  libstd-rust-dev <!nocheck>,
  librust-anyhow-1+default-dev <!nocheck>,
- librust-cc-1+default-dev (>= 1.0.46-~~) <!nocheck>,
+ librust-bitflags-2+default-dev <!nocheck>,
  librust-futures-0.3+default-dev <!nocheck>,
  librust-libc-0.2+default-dev <!nocheck>,
  librust-tokio-1+default-dev <!nocheck>,
- librust-tokio-1+macros-dev <!nocheck>,
  librust-tokio-1+net-dev <!nocheck>,
- librust-tokio-1+rt-multi-thread-dev <!nocheck>,
- librust-tokio-1+signal-dev <!nocheck>,
- librust-tokio-stream-0.1+default-dev <!nocheck>,
- libfuse3-dev <!nocheck>
+ librust-tokio-1+sync-dev <!nocheck>
 Maintainer: Proxmox Support Team <support@proxmox.com>
 Standards-Version: 4.7.2
 Vcs-Git: 
@@ -29,23 +25,19 @@ Multi-Arch: same
 Depends:
  ${misc:Depends},
  librust-anyhow-1+default-dev,
- librust-cc-1+default-dev (>= 1.0.46-~~),
+ librust-bitflags-2+default-dev,
  librust-futures-0.3+default-dev,
  librust-libc-0.2+default-dev,
  librust-tokio-1+default-dev,
- librust-tokio-1+macros-dev,
  librust-tokio-1+net-dev,
- librust-tokio-1+rt-multi-thread-dev,
- librust-tokio-1+signal-dev,
- librust-tokio-stream-0.1+default-dev,
- libfuse3-dev
+ librust-tokio-1+sync-dev
 Provides:
  librust-proxmox-fuse+default-dev (= ${binary:Version}),
- librust-proxmox-fuse-3-dev (= ${binary:Version}),
- librust-proxmox-fuse-3+default-dev (= ${binary:Version}),
- librust-proxmox-fuse-3.0-dev (= ${binary:Version}),
- librust-proxmox-fuse-3.0+default-dev (= ${binary:Version}),
- librust-proxmox-fuse-3.0.0-dev (= ${binary:Version}),
- librust-proxmox-fuse-3.0.0+default-dev (= ${binary:Version})
+ librust-proxmox-fuse-5-dev (= ${binary:Version}),
+ librust-proxmox-fuse-5+default-dev (= ${binary:Version}),
+ librust-proxmox-fuse-5.0-dev (= ${binary:Version}),
+ librust-proxmox-fuse-5.0+default-dev (= ${binary:Version}),
+ librust-proxmox-fuse-5.0.0-dev (= ${binary:Version}),
+ librust-proxmox-fuse-5.0.0+default-dev (= ${binary:Version})
 Description: Expose fuse requests as async streams - Rust source code
  Source code for Debianized Rust crate "proxmox-fuse"
