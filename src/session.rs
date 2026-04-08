@@ -795,3 +795,139 @@ fn read_body<T: Copy>(body: &[u8]) -> io::Result<T> {
     Ok(unsafe { (body.as_ptr() as *const T).read_unaligned() })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::InitFlags;
+
+    fn make_init_in(flags: InitFlags) -> FuseInitIn {
+        FuseInitIn {
+            major: protocol::FUSE_KERNEL_VERSION,
+            minor: protocol::FUSE_KERNEL_MINOR_VERSION,
+            max_readahead: 131072,
+            flags: flags.bits(),
+            flags2: 0,
+            unused: [0; 11],
+        }
+    }
+
+    #[test]
+    fn init_basic_flags() {
+        let all_flags = InitFlags::ASYNC_READ
+            | InitFlags::BIG_WRITES
+            | InitFlags::MAX_PAGES
+            | InitFlags::DO_READDIRPLUS
+            | InitFlags::READDIRPLUS_AUTO;
+        let init_in = make_init_in(all_flags);
+        let ops = EnabledOps::default();
+
+        let out = negotiate_init(&init_in, &ops);
+
+        assert_eq!(out.major, protocol::FUSE_KERNEL_VERSION);
+        assert_eq!(out.minor, protocol::FUSE_KERNEL_MINOR_VERSION);
+        assert_eq!(out.max_readahead, 131072);
+        assert_eq!(out.max_write, MAX_WRITE as u32);
+        assert_eq!(out.time_gran, 1);
+
+        let flags = InitFlags::from_bits_truncate(out.flags);
+        assert!(flags.contains(InitFlags::ASYNC_READ));
+        assert!(flags.contains(InitFlags::BIG_WRITES));
+        assert!(flags.contains(InitFlags::MAX_PAGES));
+        // readdirplus not enabled in default ops
+        assert!(!flags.contains(InitFlags::DO_READDIRPLUS));
+    }
+
+    #[test]
+    fn init_readdirplus_when_enabled() {
+        let kernel_flags = InitFlags::ASYNC_READ
+            | InitFlags::BIG_WRITES
+            | InitFlags::DO_READDIRPLUS
+            | InitFlags::READDIRPLUS_AUTO;
+        let init_in = make_init_in(kernel_flags);
+        let ops = EnabledOps {
+            readdirplus: true,
+            ..Default::default()
+        };
+
+        let out = negotiate_init(&init_in, &ops);
+        let flags = InitFlags::from_bits_truncate(out.flags);
+        assert!(flags.contains(InitFlags::DO_READDIRPLUS));
+        assert!(flags.contains(InitFlags::READDIRPLUS_AUTO));
+    }
+
+    #[test]
+    fn init_only_kernel_supported_flags() {
+        // Kernel only offers ASYNC_READ — we should not get BIG_WRITES or MAX_PAGES.
+        let init_in = make_init_in(InitFlags::ASYNC_READ);
+        let ops = EnabledOps::default();
+
+        let out = negotiate_init(&init_in, &ops);
+        let flags = InitFlags::from_bits_truncate(out.flags);
+        assert!(flags.contains(InitFlags::ASYNC_READ));
+        assert!(!flags.contains(InitFlags::BIG_WRITES));
+        assert!(!flags.contains(InitFlags::MAX_PAGES));
+        assert_eq!(out.max_pages, 0);
+    }
+
+    #[test]
+    fn init_max_pages_computed() {
+        let init_in = make_init_in(InitFlags::ASYNC_READ | InitFlags::MAX_PAGES);
+        let ops = EnabledOps::default();
+
+        let out = negotiate_init(&init_in, &ops);
+        assert!(out.max_pages > 0);
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        assert_eq!(out.max_pages as usize, MAX_WRITE / page_size);
+    }
+
+    #[test]
+    fn init_minor_version_capped() {
+        // Kernel offers a higher minor version — we should cap to ours.
+        let mut init_in = make_init_in(InitFlags::ASYNC_READ);
+        init_in.minor = 99;
+
+        let out = negotiate_init(&init_in, &EnabledOps::default());
+        assert_eq!(out.minor, protocol::FUSE_KERNEL_MINOR_VERSION);
+    }
+
+    #[test]
+    fn init_atomic_o_trunc() {
+        let init_in = make_init_in(InitFlags::ASYNC_READ | InitFlags::ATOMIC_O_TRUNC);
+        let out = negotiate_init(&init_in, &EnabledOps::default());
+        let flags = InitFlags::from_bits_truncate(out.flags);
+        assert!(flags.contains(InitFlags::ATOMIC_O_TRUNC));
+    }
+
+    #[test]
+    fn init_no_open_support() {
+        let kernel_flags =
+            InitFlags::ASYNC_READ | InitFlags::NO_OPEN_SUPPORT | InitFlags::NO_OPENDIR_SUPPORT;
+        let init_in = make_init_in(kernel_flags);
+
+        // With open disabled (default), NO_OPEN_SUPPORT should be set.
+        let ops_no_open = EnabledOps::default();
+        assert!(!ops_no_open.open);
+        let out = negotiate_init(&init_in, &ops_no_open);
+        let flags = InitFlags::from_bits_truncate(out.flags);
+        assert!(flags.contains(InitFlags::NO_OPEN_SUPPORT));
+
+        // With open enabled, NO_OPEN_SUPPORT must NOT be set.
+        let ops_open = EnabledOps {
+            open: true,
+            release: true,
+            ..Default::default()
+        };
+        let out = negotiate_init(&init_in, &ops_open);
+        let flags = InitFlags::from_bits_truncate(out.flags);
+        assert!(!flags.contains(InitFlags::NO_OPEN_SUPPORT));
+    }
+
+    #[test]
+    fn init_no_opendir_support() {
+        // NO_OPENDIR_SUPPORT should always be set (we never handle OPENDIR).
+        let init_in = make_init_in(InitFlags::ASYNC_READ | InitFlags::NO_OPENDIR_SUPPORT);
+        let out = negotiate_init(&init_in, &EnabledOps::default());
+        let flags = InitFlags::from_bits_truncate(out.flags);
+        assert!(flags.contains(InitFlags::NO_OPENDIR_SUPPORT));
+    }
+}
