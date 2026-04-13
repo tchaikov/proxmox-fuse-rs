@@ -527,8 +527,13 @@ pub struct Create {
 impl Create {
     /// The `fh` provided here will be available in later requests for this file handle.
     ///
-    /// If this returns `ReplyError::Cancelled`, no `Release` event will arrive for this file
-    /// handle. The caller must clean up any resources associated with `fh` immediately.
+    /// `Create` has both `Lookup` and `Open` semantics. If this returns
+    /// `ReplyError::Cancelled`, then:
+    ///
+    /// - no `Release` event will arrive for this file handle, so the caller must clean up any
+    ///   resources associated with `fh` immediately; and
+    /// - the lookup count was not incremented, so the caller must not expect a corresponding
+    ///   `Forget`.
     pub fn reply(self, entry: &sys::EntryParam, fh: u64) -> Result<(), ReplyError> {
         let entry_out = protocol::entry_out_from_param(entry);
         let open_out = FuseOpenOut {
