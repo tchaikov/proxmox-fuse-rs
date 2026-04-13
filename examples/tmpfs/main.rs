@@ -136,11 +136,11 @@ async fn handle_fuse(mut fuse: Fuse) -> Result<(), Error> {
                 match reply {
                     Ok(entry) => {
                         // CREATE acts as `Lookup` + `Open`
-                        entry.increment_lookup();
-                        if let Err(err) =
-                            request.reply(&to_entry_param(&entry.leak().stat.read().unwrap()), 0)
-                        {
+                        let stat = *entry.stat.read().unwrap();
+                        if let Err(err) = request.reply(&to_entry_param(&stat), 0) {
                             handle_reply_err(err)?;
+                        } else {
+                            entry.increment_lookup();
                         }
                     }
                     Err(err) => handle_io_err(err, |err| request.io_fail(err))?,
